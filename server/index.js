@@ -1,6 +1,9 @@
 require('dotenv').config();
 const express=require('express'), mongoose=require('mongoose'), cors=require('cors'), bcrypt=require('bcryptjs'), jwt=require('jsonwebtoken');
 const app=express(); app.use(cors()); app.use(express.json());
+let databaseConnection;
+function connectDatabase(){if(mongoose.connection.readyState===1)return Promise.resolve();if(!databaseConnection){if(!process.env.MONGODB_URI)return Promise.reject(new Error('MONGODB_URI must be configured.'));databaseConnection=mongoose.connect(process.env.MONGODB_URI).catch(error=>{databaseConnection=null;throw error})}return databaseConnection}
+app.use(async(req,res,next)=>{try{await connectDatabase();next()}catch(error){next(error)}});
 const User=mongoose.model('User',new mongoose.Schema({name:{type:String,required:true,trim:true},email:{type:String,required:true,unique:true,lowercase:true},password:{type:String,required:true},phone:String,monthlyIncome:{type:Number,min:0},maritalStatus:{type:String,enum:['Single','Married','Other']},subscriptionStatus:{type:String,default:'free'}},{timestamps:true}));
 const Loan=mongoose.model('Loan',new mongoose.Schema({userId:{type:mongoose.Schema.Types.ObjectId,required:true,index:true},loanName:{type:String,required:true},loanType:{type:String,required:true},principal:{type:Number,required:true,min:0},outstandingPrincipal:{type:Number,required:true,min:0},interestRate:{type:Number,required:true,min:0},originalTenure:Number,remainingTenure:Number,emi:Number,startDate:Date,endDate:Date,lenderName:String,prepaymentAvailable:Boolean},{timestamps:true}));
 const Expense=mongoose.model('Expense',new mongoose.Schema({userId:{type:mongoose.Schema.Types.ObjectId,required:true,index:true},amount:{type:Number,required:true,min:0},category:{type:String,required:true},description:{type:String,maxlength:500},date:{type:Date,required:true}},{timestamps:true}));
@@ -18,4 +21,5 @@ app.post('/api/loan-calculations',auth,(req,res)=>{const {principal,interestRate
 app.get('/api/dashboard',auth,async(req,res)=>{const [user,loans,expenses]=await Promise.all([User.findById(req.user.id).select('-password'),Loan.find({userId:req.user.id}),Expense.find({userId:req.user.id})]);res.json({user,loans,expenses})});
 app.use((err,req,res,next)=>{console.error(err);res.status(500).json({message:'Something went wrong. Please try again.'})});
 if(!process.env.JWT_SECRET)throw new Error('JWT_SECRET must be configured before starting the API.');
-mongoose.connect(process.env.MONGODB_URI).then(()=>app.listen(process.env.PORT||5000,()=>console.log('LoanLens API running'))).catch(e=>{console.error('MongoDB connection failed:',e.message);process.exit(1)});
+if(require.main===module)connectDatabase().then(()=>app.listen(process.env.PORT||5000,()=>console.log('LoanLens API running'))).catch(e=>{console.error('MongoDB connection failed:',e.message);process.exit(1)});
+module.exports=app;
