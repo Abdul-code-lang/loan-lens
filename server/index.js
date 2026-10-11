@@ -1,9 +1,11 @@
 require('dotenv').config();
 const express=require('express'), mongoose=require('mongoose'), cors=require('cors'), bcrypt=require('bcryptjs'), jwt=require('jsonwebtoken');
 const app=express(); app.use(cors()); app.use(express.json());
+app.get('/api/ping',(req,res)=>res.json({ok:true,service:'LoanLens API'}));
+app.use('/api',(req,res,next)=>{if(!process.env.JWT_SECRET)return res.status(503).json({message:'JWT_SECRET is missing from the Vercel environment variables.'});next()});
 let databaseConnection;
 function connectDatabase(){if(mongoose.connection.readyState===1)return Promise.resolve();if(!databaseConnection){if(!process.env.MONGODB_URI)return Promise.reject(new Error('MONGODB_URI must be configured.'));databaseConnection=mongoose.connect(process.env.MONGODB_URI).catch(error=>{databaseConnection=null;throw error})}return databaseConnection}
-app.use(async(req,res,next)=>{try{await connectDatabase();next()}catch(error){next(error)}});
+app.use(async(req,res,next)=>{try{await connectDatabase();next()}catch(error){console.error('MongoDB connection failed:',error.message);res.status(503).json({message:process.env.MONGODB_URI?'Database connection failed. Check MONGODB_URI and MongoDB network access.':'MONGODB_URI is missing from the Vercel environment variables.'})}});
 const User=mongoose.model('User',new mongoose.Schema({name:{type:String,required:true,trim:true},email:{type:String,required:true,unique:true,lowercase:true},password:{type:String,required:true},phone:String,monthlyIncome:{type:Number,min:0},maritalStatus:{type:String,enum:['Single','Married','Other']},subscriptionStatus:{type:String,default:'free'}},{timestamps:true}));
 const Loan=mongoose.model('Loan',new mongoose.Schema({userId:{type:mongoose.Schema.Types.ObjectId,required:true,index:true},loanName:{type:String,required:true},loanType:{type:String,required:true},principal:{type:Number,required:true,min:0},outstandingPrincipal:{type:Number,required:true,min:0},interestRate:{type:Number,required:true,min:0},originalTenure:Number,remainingTenure:Number,emi:Number,startDate:Date,endDate:Date,lenderName:String,prepaymentAvailable:Boolean},{timestamps:true}));
 const Expense=mongoose.model('Expense',new mongoose.Schema({userId:{type:mongoose.Schema.Types.ObjectId,required:true,index:true},amount:{type:Number,required:true,min:0},category:{type:String,required:true},description:{type:String,maxlength:500},date:{type:Date,required:true}},{timestamps:true}));
@@ -20,6 +22,5 @@ app.get('/api/recommendations',auth,async(req,res)=>{const expenses=await Expens
 app.post('/api/loan-calculations',auth,(req,res)=>{const {principal,interestRate,remainingTenure,additionalPayment=0}=req.body,r=Number(interestRate)/1200;let emi=r?Number(principal)*r*Math.pow(1+r,remainingTenure)/(Math.pow(1+r,remainingTenure)-1):Number(principal)/remainingTenure,bal=Number(principal),interest=0,months=0;while(bal>.01&&months<1200){let i=bal*r;interest+=i;bal-=Math.min(bal,emi+Number(additionalPayment)-i);months++}res.json({emi,estimatedNewTenure:months,estimatedNewInterest:interest,disclaimer:'Estimate only; lender terms and schedules can differ.'})});
 app.get('/api/dashboard',auth,async(req,res)=>{const [user,loans,expenses]=await Promise.all([User.findById(req.user.id).select('-password'),Loan.find({userId:req.user.id}),Expense.find({userId:req.user.id})]);res.json({user,loans,expenses})});
 app.use((err,req,res,next)=>{console.error(err);res.status(500).json({message:'Something went wrong. Please try again.'})});
-if(!process.env.JWT_SECRET)throw new Error('JWT_SECRET must be configured before starting the API.');
-if(require.main===module)connectDatabase().then(()=>app.listen(process.env.PORT||5000,()=>console.log('LoanLens API running'))).catch(e=>{console.error('MongoDB connection failed:',e.message);process.exit(1)});
+if(require.main===module){if(!process.env.JWT_SECRET)throw new Error('JWT_SECRET must be configured before starting the API.');connectDatabase().then(()=>app.listen(process.env.PORT||5000,()=>console.log('LoanLens API running'))).catch(e=>{console.error('MongoDB connection failed:',e.message);process.exit(1)})}
 module.exports=app;
