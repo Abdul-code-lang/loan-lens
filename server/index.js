@@ -24,7 +24,28 @@ async function budgetForUser(userId, overrides = {}, month) {
   const expenses = overrides.expenses || existingExpenses;
   return calculateBudget({income: overrides.income === undefined ? user.monthlyIncome : overrides.income, loans, expenses, month});
 }
-function budgetError(res, budget) { return res.status(400).json({message:`This change exceeds the 95% monthly budget by ₹${budget.exceededBy.toFixed(2)}. Reduce expenses or EMI before saving.`, budget}); }
+function money(value) { return `₹${Number(value || 0).toFixed(2)}`; }
+function budgetError(res, budget, requestedAmount, type, previousAmount = 0) {
+  const requested = Number(requestedAmount || 0);
+  const previous = Number(previousAmount || 0);
+  // The candidate is already in `budget`; restore only the change to show the pre-edit balance.
+  const availableBalance = Math.max(0, budget.remainingBudget + requested - previous);
+  const maximumAllowed = availableBalance + previous;
+  const excessAmount = Math.max(0, requested - maximumAllowed);
+  const detail = { type, availableBalance, requestedAmount: requested, excessAmount, maximumAllowed, budget };
+  if (type === 'expense') {
+    return res.status(400).json({
+      message: 'Insufficient Available Balance!',
+      detail,
+      budget,
+      description: `Your remaining monthly budget is ${money(availableBalance)}, but you are trying to add an expense of ${money(requested)}. Please reduce the expense amount to ${money(availableBalance)} or less.`
+    });
+  }
+  return res.status(400).json({
+    message: 'Your monthly EMI exceeds your available budget.', detail, budget,
+    description: `Your current available balance is ${money(availableBalance)}. The EMI of ${money(requested)} exceeds the allowed budget by ${money(excessAmount)}.`
+  });
+}
 function numericFieldsValid(body, fields, required = false) { return fields.every(key => (!required && body[key] === undefined) || (body[key] !== '' && body[key] !== null && Number.isFinite(Number(body[key])) && Number(body[key]) >= 0)); }
 function crud(path,Model){
   app.get(path,auth,async(req,res,next)=>{try{res.json(await Model.find({userId:req.user.id}).sort({createdAt:-1}))}catch(e){next(e)}});
@@ -32,8 +53,8 @@ function crud(path,Model){
     const body={...req.body,userId:req.user.id};delete body._id;delete body.id;
     if(path==='/api/expenses' && (!Number.isFinite(Number(body.amount)) || Number(body.amount)<0 || !body.date || !validDate(body.date))) return res.status(400).json({message:'A non-negative expense amount and valid date are required.'});
     if(path==='/api/loans' && (!numericFieldsValid(body,['principal','outstandingPrincipal','interestRate','remainingTenure','emi'],true) || !body.loanName || !body.loanType)) return res.status(400).json({message:'Enter complete, valid non-negative loan values.'});
-    if(path==='/api/expenses'){const existing=await Expense.find({userId:req.user.id});const budget=await budgetForUser(req.user.id,{expenses:[...existing,body]},new Date(body.date).toISOString().slice(0,7));if(budget.status==='exceeded')return budgetError(res,budget);}
-    if(path==='/api/loans'){const existing=await Loan.find({userId:req.user.id});const budget=await budgetForUser(req.user.id,{loans:[...existing,body]});if(budget.status==='exceeded')return budgetError(res,budget);}
+    if(path==='/api/expenses'){const existing=await Expense.find({userId:req.user.id});const budget=await budgetForUser(req.user.id,{expenses:[...existing,body]},new Date(body.date).toISOString().slice(0,7));if(budget.status==='exceeded')return budgetError(res,budget,body.amount,'expense');}
+    if(path==='/api/loans'){const existing=await Loan.find({userId:req.user.id});const budget=await budgetForUser(req.user.id,{loans:[...existing,body]});if(budget.status==='exceeded')return budgetError(res,budget,body.emi,'emi');}
     res.status(201).json(await Model.create(body));
   }catch(e){next(e)}});
   app.put(path+'/:id',auth,async(req,res,next)=>{try{
@@ -43,13 +64,14 @@ function crud(path,Model){
     if(path==='/api/expenses' && (!Number.isFinite(Number(candidate.amount)) || Number(candidate.amount)<0 || !candidate.date || !validDate(candidate.date)))return res.status(400).json({message:'Enter a valid non-negative expense and date.'});
     if(path==='/api/loans' && !numericFieldsValid(candidate,['principal','outstandingPrincipal','interestRate','remainingTenure','emi'],true))return res.status(400).json({message:'Enter complete, valid non-negative loan values.'});
     const records=await Model.find({userId:req.user.id});const replacement=records.map(record=>String(record._id)===String(current._id)?candidate:record);
-    const budget=path==='/api/expenses'?await budgetForUser(req.user.id,{expenses:replacement},new Date(candidate.date).toISOString().slice(0,7)):path==='/api/loans'?await budgetForUser(req.user.id,{loans:replacement}):null;if(budget?.status==='exceeded')return budgetError(res,budget);
+    const budget=path==='/api/expenses'?await budgetForUser(req.user.id,{expenses:replacement},new Date(candidate.date).toISOString().slice(0,7)):path==='/api/loans'?await budgetForUser(req.user.id,{loans:replacement}):null;
+    if(budget?.status==='exceeded') return budgetError(res,budget,path==='/api/expenses'?candidate.amount:candidate.emi,path==='/api/expenses'?'expense':'emi',path==='/api/expenses'?current.amount:current.emi);
     const x=await Model.findOneAndUpdate({_id:req.params.id,userId:req.user.id},update,{new:true,runValidators:true});res.json(x);
   }catch(e){next(e)}});
   app.delete(path+'/:id',auth,async(req,res,next)=>{try{const x=await Model.findOneAndDelete({_id:req.params.id,userId:req.user.id});if(!x)return res.status(404).json({message:'Not found'});res.status(204).end()}catch(e){next(e)}})
 };crud('/api/loans',Loan);crud('/api/expenses',Expense);crud('/api/income',Income);
 app.get('/api/recommendations',auth,async(req,res,next)=>{try{const [user,loans,expenses]=await Promise.all([User.findById(req.user.id),Loan.find({userId:req.user.id}),Expense.find({userId:req.user.id})]);const budget=calculateBudget({income:user.monthlyIncome,loans,expenses});const group={};expenses.filter(x=>new Date(x.date).toISOString().slice(0,7)===budget.month).forEach(x=>group[x.category]=(group[x.category]||0)+x.amount);const recommendations=[];if(budget.exceededBy>0)recommendations.push({category:'Budget rule',currentExpense:budget.monthlyBudgetUsed,suggestedReduction:budget.exceededBy,potentialSaving:budget.exceededBy,reason:`Your current monthly expenses and EMI exceed your allowed budget by ₹${budget.exceededBy.toFixed(2)}. Review reducible expenses to stay within the 95% limit while maintaining mandatory savings.`});Object.entries(group).filter(([c])=>['Shopping','Entertainment','Subscriptions','Food'].includes(c)).map(([category,currentExpense])=>({category,currentExpense,suggestedReduction:Math.round(currentExpense*.2),potentialSaving:Math.round(currentExpense*.2),reason:'This discretionary category may have room for a gradual review.'})).sort((a,b)=>b.potentialSaving-a.potentialSaving).forEach(x=>recommendations.push(x));res.json({budget,disclaimer:'Estimates for financial planning purposes; not professional financial advice.',recommendations})}catch(e){next(e)}});
-app.post('/api/loan-calculations',auth,async(req,res,next)=>{try{const {principal,interestRate,remainingTenure,additionalPayment=0}=req.body;const values=[principal,interestRate,remainingTenure,additionalPayment].map(Number);if(!values.every(Number.isFinite)||Number(principal)<=0||Number(remainingTenure)<=0||Number(interestRate)<0||Number(additionalPayment)<0)return res.status(400).json({message:'Enter valid non-negative loan values.'});const budget=await budgetForUser(req.user.id),availableSurplus=Math.max(0,budget.remainingBudget);if(Number(additionalPayment)>availableSurplus)return res.status(400).json({message:`Additional payments cannot exceed your genuine monthly surplus of ₹${availableSurplus.toFixed(2)}. Review expenses first.`,budget});const r=Number(interestRate)/1200;let emi=r?Number(principal)*r*Math.pow(1+r,remainingTenure)/(Math.pow(1+r,remainingTenure)-1):Number(principal)/Number(remainingTenure),bal=Number(principal),interest=0,months=0;while(bal>.01&&months<1200){let i=bal*r;interest+=i;bal-=Math.min(bal,emi+Number(additionalPayment)-i);months++}res.json({emi,estimatedNewTenure:months,estimatedNewInterest:interest,budget,disclaimer:'Estimate only; lender terms and schedules can differ.'})}catch(e){next(e)}});
+app.post('/api/loan-calculations',auth,async(req,res,next)=>{try{const {principal,interestRate,remainingTenure,additionalPayment=0}=req.body;const values=[principal,interestRate,remainingTenure,additionalPayment].map(Number);if(!values.every(Number.isFinite)||Number(principal)<=0||Number(remainingTenure)<=0||Number(interestRate)<0||Number(additionalPayment)<0)return res.status(400).json({message:'Enter valid non-negative loan values.'});const budget=await budgetForUser(req.user.id),availableSurplus=Math.max(0,budget.remainingBudget);if(Number(additionalPayment)>availableSurplus)return res.status(400).json({message:'Insufficient Balance for Additional Loan Payment!',description:`Your available monthly surplus is ${money(availableSurplus)}. You cannot allocate ${money(additionalPayment)} as an additional monthly loan payment.`,detail:{type:'additional-payment',availableBalance:availableSurplus,requestedAmount:Number(additionalPayment),maximumAllowed:availableSurplus,excessAmount:Number(additionalPayment)-availableSurplus},budget});const r=Number(interestRate)/1200;let emi=r?Number(principal)*r*Math.pow(1+r,remainingTenure)/(Math.pow(1+r,remainingTenure)-1):Number(principal)/Number(remainingTenure),bal=Number(principal),interest=0,months=0;while(bal>.01&&months<1200){let i=bal*r;interest+=i;bal-=Math.min(bal,emi+Number(additionalPayment)-i);months++}res.json({emi,estimatedNewTenure:months,estimatedNewInterest:interest,budget,disclaimer:'Estimate only; lender terms and schedules can differ.'})}catch(e){next(e)}});
 app.get('/api/dashboard',auth,async(req,res,next)=>{try{const [user,loans,expenses]=await Promise.all([User.findById(req.user.id).select('-password'),Loan.find({userId:req.user.id}),Expense.find({userId:req.user.id})]);const month=typeof req.query.month==='string'?req.query.month:undefined;res.json({user,loans,expenses,budget:calculateBudget({income:user.monthlyIncome,loans,expenses,month})})}catch(e){next(e)}});
 app.use((err,req,res,next)=>{console.error(err);res.status(500).json({message:'Something went wrong. Please try again.'})});
 if(require.main===module){if(!process.env.JWT_SECRET)throw new Error('JWT_SECRET must be configured before starting the API.');connectDatabase().then(()=>app.listen(process.env.PORT||5000,()=>console.log('LoanLens API running'))).catch(e=>{console.error('MongoDB connection failed:',e.message);process.exit(1)})}
